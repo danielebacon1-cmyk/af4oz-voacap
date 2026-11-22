@@ -5,6 +5,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
+from threading import Lock
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -85,11 +89,70 @@ def forecast(grid, year, month, hour, ssn, origin="EM75LD"):
             "reliability_target": RELIABILITY_TARGET, "routes": routes}
 
 
+HAMQTH_API = "https://www.hamqth.com/api/v2"
+hamqth_lock = Lock()
+hamqth_session = ("", 0.0)
+
+
+def hamqth_json(path, **kwargs):
+    with urlopen(Request(HAMQTH_API + path, **kwargs), timeout=10) as response:
+        return json.load(response)
+
+
+def hamqth_token(callsign, password, rejected=None):
+    global hamqth_session
+    with hamqth_lock:
+        token, expiry = hamqth_session
+        if token != rejected and time.monotonic() < expiry:
+            return token
+        result = hamqth_json(
+            "/login",
+            data=json.dumps({"callsign": callsign, "password": password}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        token = result["token"]
+        hamqth_session = (token, time.monotonic() + max(0, result["expiresIn"] - 60))
+        return token
+
+
+def lookup_grid(call, callsign, password):
+    token = hamqth_token(callsign, password)
+    try:
+        record = hamqth_json(f"/callbook/{call}?app=AF4OZ", headers={"Authorization": f"Bearer {token}"})
+    except HTTPError as error:
+        if error.code != 401:
+            raise
+        token = hamqth_token(callsign, password, rejected=token)
+        record = hamqth_json(f"/callbook/{call}?app=AF4OZ", headers={"Authorization": f"Bearer {token}"})
+    grid = ((record.get("location") or {}).get("grid") or "").upper()
+    return grid if re.fullmatch(r"[A-R]{2}[0-9]{2}(?:[A-X]{2})?", grid) else None
+
+
+def callbook_response(call):
+    if not re.fullmatch(r"[A-Z0-9]{3,12}", call):
+        return 400, {"error": "Enter a valid call sign."}
+    callsign = os.environ.get("HAMQTH_CALLSIGN")
+    password = os.environ.get("HAMQTH_PASSWORD")
+    if not callsign or not password:
+        return 503, {"error": "HamQTH lookup has not been configured."}
+    try:
+        return 200, {"call": call, "grid": lookup_grid(call, callsign, password), "source": "HamQTH"}
+    except HTTPError as error:
+        if error.code == 404 and "/callbook/" in error.url:
+            return 200, {"call": call, "grid": None, "source": "HamQTH"}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return 502, {"error": "HamQTH lookup is temporarily unavailable."}
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         request = urlsplit(self.path)
         args = parse_qs(request.query)
         try:
+            if request.path == "/lookup":
+                status, payload = callbook_response(args.get("call", [""])[0].strip().upper())
+                return self.send_json(status, payload)
             if request.path == "/health":
                 payload = {"ready": Path(ENGINE).is_file() and DATA.is_dir()}
             elif request.path == "/forecast":
@@ -107,6 +170,9 @@ class Handler(BaseHTTPRequestHandler):
             status, payload = 400, {"error": str(error)}
         except (OSError, RuntimeError, subprocess.SubprocessError, StopIteration):
             status, payload = 502, {"error": "Forecast unavailable."}
+        self.send_json(status, payload)
+
+    def send_json(self, status, payload):
         body = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
