@@ -1,3 +1,4 @@
+import csv
 import json
 import math
 import os
@@ -5,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from threading import Lock
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -149,11 +151,44 @@ def callbook_response(call):
         return 502, {"error": str(error)}
 
 
+LOTW_URL = "https://lotw.arrl.org/lotw-user-activity.csv"
+lotw_lock = Lock()
+lotw_cache = ({}, 0.0)
+
+
+def last_lotw_upload(call):
+    global lotw_cache
+    with lotw_lock:
+        uploads, expires = lotw_cache
+        if time.monotonic() >= expires:
+            with urlopen(LOTW_URL, timeout=15) as response:
+                rows = csv.reader(line.decode("utf-8-sig") for line in response)
+                uploads = {
+                    row[0].strip().upper(): row[1].strip() + "T" + row[2].strip() + "Z"
+                    for row in rows
+                    if len(row) == 3 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", row[1].strip())
+                    and re.fullmatch(r"\d{2}:\d{2}:\d{2}", row[2].strip())
+                }
+            if not uploads:
+                raise OSError("LoTW activity list was empty.")
+            lotw_cache = (uploads, time.monotonic() + 3600)
+        return uploads.get(call)
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         request = urlsplit(self.path)
         args = parse_qs(request.query)
         try:
+            if request.path == "/lotw":
+                call = args.get("call", [""])[0].strip().upper()
+                if not re.fullmatch(r"[A-Z0-9]{3,12}", call):
+                    return self.send_json(400, {"error": "Enter a valid call sign."})
+                try:
+                    upload = last_lotw_upload(call)
+                except (OSError, ValueError, csv.Error):
+                    return self.send_json(502, {"error": "LoTW activity is unavailable."})
+                return self.send_json(200, {"call": call, "last_upload": upload})
             if request.path == "/lookup":
                 status, payload = callbook_response(args.get("call", [""])[0].strip().upper())
                 return self.send_json(status, payload)
