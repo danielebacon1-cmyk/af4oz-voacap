@@ -3,11 +3,12 @@ import math
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import tempfile
 import time
 from threading import Lock
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -94,9 +95,30 @@ hamqth_lock = Lock()
 hamqth_session = ("", 0.0)
 
 
+class HamQTHFailure(Exception):
+    def __init__(self, stage, reason, upstream_status=None):
+        self.stage = stage
+        self.reason = reason
+        self.upstream_status = upstream_status
+
+
 def hamqth_json(path, **kwargs):
-    with urlopen(Request(HAMQTH_API + path, **kwargs), timeout=10) as response:
-        return json.load(response)
+    stage = "login" if path == "/login" else "lookup"
+    try:
+        with urlopen(Request(HAMQTH_API + path, **kwargs), timeout=10) as response:
+            result = json.load(response)
+        if not isinstance(result, dict):
+            raise ValueError("Expected a JSON object")
+        return result
+    except HTTPError:
+        raise
+    except URLError as error:
+        reason = "certificate" if isinstance(error.reason, ssl.SSLCertVerificationError) else "connection"
+        raise HamQTHFailure(stage, reason) from None
+    except (TimeoutError, OSError):
+        raise HamQTHFailure(stage, "connection") from None
+    except ValueError:
+        raise HamQTHFailure(stage, "invalid_response") from None
 
 
 def hamqth_token(callsign, password, rejected=None):
@@ -105,13 +127,20 @@ def hamqth_token(callsign, password, rejected=None):
         token, expiry = hamqth_session
         if token != rejected and time.monotonic() < expiry:
             return token
-        result = hamqth_json(
-            "/login",
-            data=json.dumps({"callsign": callsign, "password": password}).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        token = result["token"]
-        hamqth_session = (token, time.monotonic() + max(0, result["expiresIn"] - 60))
+        try:
+            result = hamqth_json(
+                "/login",
+                data=json.dumps({"callsign": callsign, "password": password}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            token = result["token"]
+            if not isinstance(token, str) or not token:
+                raise ValueError("Missing token")
+            hamqth_session = (token, time.monotonic() + max(0, result["expiresIn"] - 60))
+        except HTTPError as error:
+            raise HamQTHFailure("login", "http_error", error.code) from None
+        except (KeyError, TypeError, ValueError):
+            raise HamQTHFailure("login", "invalid_response") from None
         return token
 
 
@@ -147,11 +176,17 @@ def callbook_response(call):
     try:
         return 200, {"call": call, "grid": lookup_grid(call, callsign, password), "source": "HamQTH"}
     except HTTPError as error:
-        if error.code == 404 and "/callbook/" in error.url:
+        if error.code == 404:
             return 200, {"call": call, "grid": None, "source": "HamQTH"}
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
-    return 502, {"error": "HamQTH lookup is temporarily unavailable."}
+        return 502, {"error": "HamQTH lookup failed.", "stage": "lookup", "upstream_status": error.code}
+    except HamQTHFailure as error:
+        payload = {"error": "HamQTH request failed.", "stage": error.stage, "reason": error.reason}
+        if error.upstream_status is not None:
+            payload["upstream_status"] = error.upstream_status
+        return 502, payload
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return 502, {"error": "HamQTH lookup failed.", "stage": "lookup", "reason": "invalid_response"}
+
 
 
 class Handler(BaseHTTPRequestHandler):

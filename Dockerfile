@@ -1,5 +1,5 @@
 FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y --no-install-recommends python3 voacapl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates python3 voacapl && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY app.py .
 USER 65534:65534
