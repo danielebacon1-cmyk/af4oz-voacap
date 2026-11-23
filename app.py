@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 DATA = Path(os.environ.get("VOACAP_DATA", "/usr/share/voacapl/itshfbc"))
 ENGINE = os.environ.get("VOACAP_BIN", "/usr/bin/voacapl")
 RELIABILITY_TARGET = .90
-BANDS = {"80": 3.8, "60": 5.35, "40": 7.2, "30": 10.12, "20": 14.2,
+BANDS = {"160": 1.9, "80": 3.8, "60": 5.35, "40": 7.2, "30": 10.12, "20": 14.2,
          "17": 18.14, "15": 21.3, "12": 24.95, "10": 28.4}
 
 
@@ -49,7 +49,7 @@ def forecast(grid, year, month, hour, ssn, origin="EM75LD"):
     template = re.sub(r"^MONTH.*$", f"MONTH      {year:4}{month:5.2f}", template, flags=re.M)
     template = re.sub(r"^SUNSPOT.*$", f"SUNSPOT   {ssn:5.1f}", template, flags=re.M)
     template = template.replace("73.0", "38.0").replace("500.0000", "  0.1000")
-    template = re.sub(r"^FREQUENCY.*$", "FREQUENCY " + "".join(f"{x:5.2f}" for x in [*BANDS.values(), 0, 0]), template, flags=re.M)
+    template = re.sub(r"^FREQUENCY.*$", "FREQUENCY " + "".join(f"{x:5.2f}" for x in [*BANDS.values(), 0]), template, flags=re.M)
     routes = {}
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
@@ -71,7 +71,7 @@ def forecast(grid, year, month, hour, ssn, origin="EM75LD"):
                 if line.rstrip().endswith("FREQ") and float(line.split()[0]) % 24 == hour:
                     muf = float(line.split()[1])
                     rel = next(x.split() for x in lines[i:i + 30] if x.rstrip().endswith("REL"))
-                    reliability = dict(zip(BANDS, map(float, rel[1:10])))
+                    reliability = dict(zip(BANDS, map(float, rel[1:1 + len(BANDS)])))
                     passing = [frequency for band, frequency in BANDS.items()
                                if reliability[band] >= RELIABILITY_TARGET]
                     routes[direction] = {
