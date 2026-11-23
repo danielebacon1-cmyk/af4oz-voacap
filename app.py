@@ -134,7 +134,16 @@ def callbook_response(call):
     callsign = os.environ.get("HAMQTH_CALLSIGN")
     password = os.environ.get("HAMQTH_PASSWORD")
     if not callsign or not password:
-        return 503, {"error": "HamQTH lookup has not been configured."}
+        missing = [
+            name for name, value in (
+                ("HAMQTH_CALLSIGN", callsign),
+                ("HAMQTH_PASSWORD", password),
+            ) if not value
+        ]
+        return 503, {
+            "error": "HamQTH lookup has not been configured.",
+            "missing_settings": missing,
+        }
     try:
         return 200, {"call": call, "grid": lookup_grid(call, callsign, password), "source": "HamQTH"}
     except HTTPError as error:
