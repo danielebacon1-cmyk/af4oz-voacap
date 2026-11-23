@@ -3,16 +3,15 @@ import math
 import os
 import re
 import shutil
-import ssl
 import subprocess
 import tempfile
-import time
 from threading import Lock
-from urllib.error import HTTPError, URLError
+from urllib.error import URLError
 from urllib.request import Request, urlopen
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
+from xml.etree import ElementTree
 
 DATA = Path(os.environ.get("VOACAP_DATA", "/usr/share/voacapl/itshfbc"))
 ENGINE = os.environ.get("VOACAP_BIN", "/usr/bin/voacapl")
@@ -90,103 +89,64 @@ def forecast(grid, year, month, hour, ssn, origin="EM75LD"):
             "reliability_target": RELIABILITY_TARGET, "routes": routes}
 
 
-HAMQTH_API = "https://www.hamqth.com/api/v2"
-hamqth_lock = Lock()
-hamqth_session = ("", 0.0)
+QRZ_API = "https://xmldata.qrz.com/xml/current/"
+qrz_lock = Lock()
+qrz_session = ""
 
 
-class HamQTHFailure(Exception):
-    def __init__(self, stage, reason, upstream_status=None):
-        self.stage = stage
-        self.reason = reason
-        self.upstream_status = upstream_status
-
-
-def hamqth_json(path, **kwargs):
-    stage = "login" if path == "/login" else "lookup"
+def qrz_xml(params):
     try:
-        with urlopen(Request(HAMQTH_API + path, **kwargs), timeout=10) as response:
-            result = json.load(response)
-        if not isinstance(result, dict):
-            raise ValueError("Expected a JSON object")
-        return result
-    except HTTPError:
-        raise
-    except URLError as error:
-        reason = "certificate" if isinstance(error.reason, ssl.SSLCertVerificationError) else "connection"
-        raise HamQTHFailure(stage, reason) from None
-    except (TimeoutError, OSError):
-        raise HamQTHFailure(stage, "connection") from None
-    except ValueError:
-        raise HamQTHFailure(stage, "invalid_response") from None
+        url = QRZ_API + "?" + urlencode(params)
+        with urlopen(url, timeout=10) as response:
+            root = ElementTree.parse(response).getroot()
+    except (OSError, URLError, ElementTree.ParseError):
+        raise RuntimeError("QRZ lookup service is unavailable.") from None
+    if root.tag.rsplit("}", 1)[-1] != "QRZDatabase":
+        raise RuntimeError("QRZ returned an unexpected response.")
+    return root
 
 
-def hamqth_token(callsign, password, rejected=None):
-    global hamqth_session
-    with hamqth_lock:
-        token, expiry = hamqth_session
-        if token != rejected and time.monotonic() < expiry:
-            return token
-        try:
-            result = hamqth_json(
-                "/login",
-                data=json.dumps({"callsign": callsign, "password": password}).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            token = result["token"]
-            if not isinstance(token, str) or not token:
-                raise ValueError("Missing token")
-            hamqth_session = (token, time.monotonic() + max(0, result["expiresIn"] - 60))
-        except HTTPError as error:
-            raise HamQTHFailure("login", "http_error", error.code) from None
-        except (KeyError, TypeError, ValueError):
-            raise HamQTHFailure("login", "invalid_response") from None
-        return token
+def qrz_key(username, password, rejected=None):
+    global qrz_session
+    with qrz_lock:
+        if not qrz_session or qrz_session == rejected:
+            root = qrz_xml({"username": username, "password": password, "agent": "AF4OZ"})
+            qrz_session = (root.findtext("{*}Session/{*}Key") or "").strip()
+            if not qrz_session:
+                raise RuntimeError("QRZ sign-in failed. Check the server credentials.")
+        return qrz_session
 
 
-def lookup_grid(call, callsign, password):
-    token = hamqth_token(callsign, password)
-    try:
-        record = hamqth_json(f"/callbook/{call}?app=AF4OZ", headers={"Authorization": f"Bearer {token}"})
-    except HTTPError as error:
-        if error.code != 401:
-            raise
-        token = hamqth_token(callsign, password, rejected=token)
-        record = hamqth_json(f"/callbook/{call}?app=AF4OZ", headers={"Authorization": f"Bearer {token}"})
-    grid = ((record.get("location") or {}).get("grid") or "").upper()
-    return grid if re.fullmatch(r"[A-R]{2}[0-9]{2}(?:[A-X]{2})?", grid) else None
+def lookup_grid(call, username, password):
+    key = qrz_key(username, password)
+    root = qrz_xml({"s": key, "callsign": call})
+    error = (root.findtext("{*}Session/{*}Error") or "").lower()
+    if "session" in error or "key" in error:
+        key = qrz_key(username, password, rejected=key)
+        root = qrz_xml({"s": key, "callsign": call})
+        error = (root.findtext("{*}Session/{*}Error") or "").lower()
+    if "not found" in error:
+        return None
+    if error:
+        raise RuntimeError("QRZ could not complete the callsign lookup.")
+    returned_call = (root.findtext("{*}Callsign/{*}call") or "").strip().upper()
+    grid = (root.findtext("{*}Callsign/{*}grid") or "").strip().upper()
+    if returned_call == call and re.fullmatch(r"[A-R]{2}[0-9]{2}(?:[A-X]{2})?", grid):
+        return grid
+    return None
 
 
 def callbook_response(call):
     if not re.fullmatch(r"[A-Z0-9]{3,12}", call):
         return 400, {"error": "Enter a valid call sign."}
-    callsign = os.environ.get("HAMQTH_CALLSIGN")
-    password = os.environ.get("HAMQTH_PASSWORD")
-    if not callsign or not password:
-        missing = [
-            name for name, value in (
-                ("HAMQTH_CALLSIGN", callsign),
-                ("HAMQTH_PASSWORD", password),
-            ) if not value
-        ]
-        return 503, {
-            "error": "HamQTH lookup has not been configured.",
-            "missing_settings": missing,
-        }
+    username = os.environ.get("QRZ_USERNAME")
+    password = os.environ.get("QRZ_PASSWORD")
+    if not username or not password:
+        return 503, {"error": "QRZ lookup has not been configured."}
     try:
-        return 200, {"call": call, "grid": lookup_grid(call, callsign, password), "source": "HamQTH"}
-    except HTTPError as error:
-        if error.code == 404:
-            return 200, {"call": call, "grid": None, "source": "HamQTH"}
-        return 502, {"error": "HamQTH lookup failed.", "stage": "lookup", "upstream_status": error.code}
-    except HamQTHFailure as error:
-        payload = {"error": "HamQTH request failed.", "stage": error.stage, "reason": error.reason}
-        if error.upstream_status is not None:
-            payload["upstream_status"] = error.upstream_status
-        return 502, payload
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        return 502, {"error": "HamQTH lookup failed.", "stage": "lookup", "reason": "invalid_response"}
-
+        return 200, {"call": call, "grid": lookup_grid(call, username, password), "source": "QRZ"}
+    except RuntimeError as error:
+        return 502, {"error": str(error)}
 
 
 class Handler(BaseHTTPRequestHandler):
